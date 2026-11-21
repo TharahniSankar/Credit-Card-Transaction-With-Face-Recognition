@@ -1,0 +1,595 @@
+import sqlite3
+import os
+import json
+import hashlib
+from datetime import datetime, timedelta
+from werkzeug.security import generate_password_hash
+from config import Config
+
+def get_db_connection():
+    """Returns a SQLite connection with row factory enabled."""
+    conn = sqlite3.connect(Config.DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+def init_db():
+    """Initializes the database schema and creates tables if they do not exist."""
+    schema_path = os.path.join(os.path.dirname(__file__), 'schema.sql')
+    with open(schema_path, 'r') as f:
+        schema_sql = f.read()
+        
+    conn = get_db_connection()
+    try:
+        conn.executescript(schema_sql)
+        conn.commit()
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------
+# User Functions
+# -------------------------------------------------------------
+
+def create_user(full_name, email, phone, password_hash, face_encoding_json=None, face_image_path=None):
+    """Inserts a new registered user."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO users (full_name, email, phone, password_hash, face_encoding, face_image_path)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (full_name, email.strip().lower(), phone.strip(), password_hash, face_encoding_json, face_image_path))
+        user_id = cursor.lastrowid
+        conn.commit()
+        return user_id
+    except sqlite3.IntegrityError:
+        return None
+    finally:
+        conn.close()
+
+def get_user_by_email(email):
+    """Fetches user record by email."""
+    conn = get_db_connection()
+    try:
+        user = conn.execute("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", (email.strip(),)).fetchone()
+        return user
+    finally:
+        conn.close()
+
+def get_user_by_id(user_id):
+    """Fetches user record by ID."""
+    conn = get_db_connection()
+    try:
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return user
+    finally:
+        conn.close()
+
+def update_user_face(user_id, face_encoding_json, face_image_path):
+    """Updates user's facial encoding and image path."""
+    conn = get_db_connection()
+    try:
+        conn.execute("""
+            UPDATE users 
+            SET face_encoding = ?, face_image_path = ?, failed_face_attempts = 0
+            WHERE id = ?
+        """, (face_encoding_json, face_image_path, user_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def update_user_profile(user_id, full_name, phone):
+    """Updates user's name and phone number."""
+    conn = get_db_connection()
+    try:
+        conn.execute("""
+            UPDATE users SET full_name = ?, phone = ? WHERE id = ?
+        """, (full_name, phone, user_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def increment_failed_face_attempts(user_id):
+    """Increments the count of failed face verification attempts."""
+    conn = get_db_connection()
+    try:
+        conn.execute("""
+            UPDATE users SET failed_face_attempts = failed_face_attempts + 1 WHERE id = ?
+        """, (user_id,))
+        conn.commit()
+        cur = conn.execute("SELECT failed_face_attempts FROM users WHERE id = ?", (user_id,))
+        row = cur.fetchone()
+        return row['failed_face_attempts'] if row else 0
+    finally:
+        conn.close()
+
+def reset_failed_face_attempts(user_id):
+    """Resets failed face attempts upon successful verification."""
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE users SET failed_face_attempts = 0 WHERE id = ?", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_all_users():
+    """Returns all registered users with card counts and transaction counts."""
+    conn = get_db_connection()
+    try:
+        query = """
+            SELECT u.*,
+                   (SELECT COUNT(*) FROM credit_cards WHERE user_id = u.id) AS card_count,
+                   (SELECT COUNT(*) FROM transactions WHERE user_id = u.id) AS txn_count
+            FROM users u
+            ORDER BY u.created_at DESC
+        """
+        users = conn.execute(query).fetchall()
+        return users
+    finally:
+        conn.close()
+
+def toggle_user_status(user_id):
+    """Toggles user active / suspended status."""
+    conn = get_db_connection()
+    try:
+        user = conn.execute("SELECT is_active FROM users WHERE id = ?", (user_id,)).fetchone()
+        if user:
+            new_status = 0 if user['is_active'] == 1 else 1
+            conn.execute("UPDATE users SET is_active = ? WHERE id = ?", (new_status, user_id))
+            conn.commit()
+            return new_status
+        return None
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------
+# Credit Card Functions
+# -------------------------------------------------------------
+
+def mask_card_number(raw_card_number):
+    """
+    Masks a 16-digit card number: keeps only last 4 digits visible.
+    Example: '1234567812345678' -> '**** **** **** 5678'
+    """
+    clean_num = ''.join(c for c in raw_card_number if c.isdigit())
+    if len(clean_num) < 4:
+        return "****"
+    last4 = clean_num[-4:]
+    return f"**** **** **** {last4}"
+
+def hash_card_number(raw_card_number):
+    """Hashes card number with SHA-256 for duplicate detection without storing plain text."""
+    clean_num = ''.join(c for c in raw_card_number if c.isdigit())
+    return hashlib.sha256(clean_num.encode('utf-8')).hexdigest()
+
+def detect_card_network(card_number):
+    """Detects card brand from leading digits."""
+    clean = ''.join(c for c in card_number if c.isdigit())
+    if clean.startswith('4'):
+        return 'Visa'
+    elif clean.startswith(('51', '52', '53', '54', '55')) or (len(clean) >= 4 and 2221 <= int(clean[:4]) <= 2720):
+        return 'MasterCard'
+    elif clean.startswith(('34', '37')):
+        return 'American Express'
+    elif clean.startswith(('6011', '65')) or clean.startswith(('644', '645')):
+        return 'Discover'
+    elif clean.startswith(('60', '6521', '6522', '508')):
+        return 'RuPay'
+    return 'Credit Card'
+
+def add_credit_card(user_id, cardholder_name, raw_card_number, expiry_month, expiry_year, card_limit=5000.00):
+    """Adds a new credit card securely, storing ONLY masked digits and hash."""
+    clean_num = ''.join(c for c in raw_card_number if c.isdigit())
+    if len(clean_num) < 12 or len(clean_num) > 19:
+        return False, "Invalid card number length (must be 12-19 digits)."
+        
+    masked = mask_card_number(clean_num)
+    hashed = hash_card_number(clean_num)
+    last4 = clean_num[-4:]
+    network = detect_card_network(clean_num)
+    
+    conn = get_db_connection()
+    try:
+        # Check if user already added this exact card
+        existing = conn.execute("""
+            SELECT id FROM credit_cards WHERE user_id = ? AND card_number_hash = ?
+        """, (user_id, hashed)).fetchone()
+        
+        if existing:
+            return False, "This credit card is already registered to your account."
+            
+        # Check if user has any existing cards; if none, make this primary
+        count = conn.execute("SELECT COUNT(*) as c FROM credit_cards WHERE user_id = ?", (user_id,)).fetchone()['c']
+        is_primary = 1 if count == 0 else 0
+        
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO credit_cards (user_id, cardholder_name, card_number_masked, card_number_hash, last4,
+                                      card_network, expiry_month, expiry_year, card_limit, available_balance, is_primary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, cardholder_name.upper().strip(), masked, hashed, last4,
+              network, expiry_month.zfill(2), expiry_year, card_limit, card_limit, is_primary))
+        card_id = cursor.lastrowid
+        conn.commit()
+        return True, card_id
+    except Exception as ex:
+        return False, f"Failed to add card: {str(ex)}"
+    finally:
+        conn.close()
+
+def get_user_cards(user_id):
+    """Retrieves all active cards for a specific user."""
+    conn = get_db_connection()
+    try:
+        cards = conn.execute("""
+            SELECT * FROM credit_cards 
+            WHERE user_id = ? AND is_active = 1
+            ORDER BY is_primary DESC, created_at DESC
+        """, (user_id,)).fetchall()
+        return cards
+    finally:
+        conn.close()
+
+def get_card_by_id(card_id, user_id=None):
+    """Retrieves a specific credit card."""
+    conn = get_db_connection()
+    try:
+        if user_id:
+            card = conn.execute("SELECT * FROM credit_cards WHERE id = ? AND user_id = ?", (card_id, user_id)).fetchone()
+        else:
+            card = conn.execute("SELECT * FROM credit_cards WHERE id = ?", (card_id,)).fetchone()
+        return card
+    finally:
+        conn.close()
+
+def delete_credit_card(card_id, user_id):
+    """Deletes or deactivates a card owned by user."""
+    conn = get_db_connection()
+    try:
+        conn.execute("DELETE FROM credit_cards WHERE id = ? AND user_id = ?", (card_id, user_id))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+def set_primary_card(user_id, card_id):
+    """Marks a card as primary for the user."""
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE credit_cards SET is_primary = 0 WHERE user_id = ?", (user_id,))
+        conn.execute("UPDATE credit_cards SET is_primary = 1 WHERE id = ? AND user_id = ?", (card_id, user_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def deduct_card_balance(card_id, amount):
+    """Deducts approved transaction amount from available card balance."""
+    conn = get_db_connection()
+    try:
+        card = conn.execute("SELECT available_balance FROM credit_cards WHERE id = ?", (card_id,)).fetchone()
+        if not card or card['available_balance'] < amount:
+            return False, "Insufficient credit balance."
+            
+        new_balance = round(card['available_balance'] - amount, 2)
+        conn.execute("UPDATE credit_cards SET available_balance = ? WHERE id = ?", (new_balance, card_id))
+        conn.commit()
+        return True, new_balance
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------
+# Transaction Functions
+# -------------------------------------------------------------
+
+def generate_transaction_id():
+    """Generates unique formatted Transaction ID (e.g. TXN-20261121-8B3E)."""
+    import random
+    import string
+    now_str = datetime.now().strftime("%Y%m%d")
+    random_hex = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"TXN-{now_str}-{random_hex}"
+
+def record_transaction(transaction_id, user_id, card_id, merchant_name, category, amount,
+                       status, failure_reason=None, face_match_score=0.0, face_verified=0,
+                       liveness_checked=0, ip_address="127.0.0.1"):
+    """Inserts a transaction entry."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO transactions (transaction_id, user_id, card_id, merchant_name, category, amount,
+                                      status, failure_reason, face_match_score, face_verified, liveness_checked, ip_address)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (transaction_id, user_id, card_id, merchant_name, category, float(amount),
+              status, failure_reason, float(face_match_score), int(face_verified), int(liveness_checked), ip_address))
+        txn_id = cursor.lastrowid
+        conn.commit()
+        return txn_id
+    finally:
+        conn.close()
+
+def get_transaction_by_id(txn_id):
+    """Retrieves transaction details along with card and user info."""
+    conn = get_db_connection()
+    try:
+        query = """
+            SELECT t.*, 
+                   c.card_number_masked, c.card_network, c.cardholder_name,
+                   u.full_name as user_name, u.email as user_email
+            FROM transactions t
+            LEFT JOIN credit_cards c ON t.card_id = c.id
+            LEFT JOIN users u ON t.user_id = u.id
+            WHERE t.id = ?
+        """
+        return conn.execute(query, (txn_id,)).fetchone()
+    finally:
+        conn.close()
+
+def get_user_transactions(user_id, status_filter=None, search_query=None, limit=50):
+    """Fetches transaction history for a specific user with filtering."""
+    conn = get_db_connection()
+    try:
+        query = """
+            SELECT t.*, c.card_number_masked, c.card_network
+            FROM transactions t
+            LEFT JOIN credit_cards c ON t.card_id = c.id
+            WHERE t.user_id = ?
+        """
+        params = [user_id]
+        
+        if status_filter and status_filter.upper() != 'ALL':
+            query += " AND t.status = ?"
+            params.append(status_filter.upper())
+            
+        if search_query:
+            query += " AND (t.merchant_name LIKE ? OR t.transaction_id LIKE ?)"
+            params.append(f"%{search_query}%")
+            params.append(f"%{search_query}%")
+            
+        query += " ORDER BY t.created_at DESC LIMIT ?"
+        params.append(limit)
+        
+        return conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+def get_all_transactions(status_filter=None, search_query=None, limit=100):
+    """Admin function: returns all transactions across the entire system."""
+    conn = get_db_connection()
+    try:
+        query = """
+            SELECT t.*, 
+                   u.full_name as user_name, u.email as user_email,
+                   c.card_number_masked, c.card_network
+            FROM transactions t
+            LEFT JOIN users u ON t.user_id = u.id
+            LEFT JOIN credit_cards c ON t.card_id = c.id
+            WHERE 1=1
+        """
+        params = []
+        if status_filter and status_filter.upper() != 'ALL':
+            query += " AND t.status = ?"
+            params.append(status_filter.upper())
+        if search_query:
+            query += " AND (t.merchant_name LIKE ? OR t.transaction_id LIKE ? OR u.email LIKE ?)"
+            params.append(f"%{search_query}%")
+            params.append(f"%{search_query}%")
+            params.append(f"%{search_query}%")
+            
+        query += " ORDER BY t.created_at DESC LIMIT ?"
+        params.append(limit)
+        return conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+def get_dashboard_metrics():
+    """Calculates overall metrics for Admin Dashboard."""
+    conn = get_db_connection()
+    try:
+        total_users = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()['c']
+        total_cards = conn.execute("SELECT COUNT(*) as c FROM credit_cards").fetchone()['c']
+        
+        txn_stats = conn.execute("""
+            SELECT 
+                COUNT(*) as total_txns,
+                SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) as success_txns,
+                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed_txns,
+                SUM(CASE WHEN status = 'SUSPICIOUS' THEN 1 ELSE 0 END) as suspicious_txns,
+                SUM(CASE WHEN status = 'SUCCESS' THEN amount ELSE 0 END) as total_volume
+            FROM transactions
+        """).fetchone()
+        
+        total_txns = txn_stats['total_txns'] or 0
+        success_txns = txn_stats['success_txns'] or 0
+        failed_txns = txn_stats['failed_txns'] or 0
+        suspicious_txns = txn_stats['suspicious_txns'] or 0
+        total_volume = txn_stats['total_volume'] or 0.0
+        
+        success_rate = round((success_txns / total_txns * 100), 1) if total_txns > 0 else 100.0
+        
+        # Recent 7 days volume query for chart
+        daily_trends = conn.execute("""
+            SELECT DATE(created_at) as txn_date, 
+                   COUNT(*) as total_count,
+                   SUM(CASE WHEN status = 'SUCCESS' THEN amount ELSE 0 END) as daily_volume
+            FROM transactions
+            GROUP BY DATE(created_at)
+            ORDER BY txn_date DESC
+            LIMIT 7
+        """).fetchall()
+        
+        return {
+            "total_users": total_users,
+            "total_cards": total_cards,
+            "total_txns": total_txns,
+            "success_txns": success_txns,
+            "failed_txns": failed_txns,
+            "suspicious_txns": suspicious_txns,
+            "total_volume": round(total_volume, 2),
+            "success_rate": success_rate,
+            "daily_trends": [dict(r) for r in daily_trends]
+        }
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------
+# Admin & Security Log Functions
+# -------------------------------------------------------------
+
+def get_admin_by_username(username_or_email):
+    """Retrieves administrator credentials."""
+    conn = get_db_connection()
+    try:
+        admin = conn.execute("""
+            SELECT * FROM admin_users 
+            WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)
+        """, (username_or_email.strip(), username_or_email.strip())).fetchone()
+        return admin
+    finally:
+        conn.close()
+
+def log_security_event(event_type, user_id=None, details="", ip_address="127.0.0.1"):
+    """Logs system security events for compliance and fraud detection."""
+    conn = get_db_connection()
+    try:
+        conn.execute("""
+            INSERT INTO security_logs (event_type, user_id, details, ip_address)
+            VALUES (?, ?, ?, ?)
+        """, (event_type, user_id, details, ip_address))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_suspicious_activities(limit=25):
+    """Returns flagged transactions and security logs indicating potential fraud."""
+    conn = get_db_connection()
+    try:
+        suspicious_txns = conn.execute("""
+            SELECT t.*, u.full_name as user_name, u.email as user_email, c.card_number_masked
+            FROM transactions t
+            LEFT JOIN users u ON t.user_id = u.id
+            LEFT JOIN credit_cards c ON t.card_id = c.id
+            WHERE t.status IN ('FAILED', 'SUSPICIOUS')
+            ORDER BY t.created_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return suspicious_txns
+    finally:
+        conn.close()
+
+def get_recent_security_logs(limit=20):
+    """Fetches latest security audit events."""
+    conn = get_db_connection()
+    try:
+        logs = conn.execute("""
+            SELECT s.*, u.email as user_email
+            FROM security_logs s
+            LEFT JOIN users u ON s.user_id = u.id
+            ORDER BY s.created_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return logs
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------
+# Seed Initial Test Data
+# -------------------------------------------------------------
+
+def seed_sample_data():
+    """
+    Populates sample accounts, credit cards, and historical transactions
+    so the system is immediately fully testable right out of the box.
+    """
+    init_db()
+    conn = get_db_connection()
+    try:
+        # 1. Admin Account: admin / admin123
+        admin_check = conn.execute("SELECT id FROM admin_users WHERE username = 'admin'").fetchone()
+        if not admin_check:
+            admin_pwd = generate_password_hash("admin123")
+            conn.execute("""
+                INSERT INTO admin_users (username, email, password_hash, full_name, role)
+                VALUES ('admin', 'admin@banksecure.com', ?, 'Chief Security Officer', 'Super Administrator')
+            """, (admin_pwd,))
+            
+        # 2. Sample User: john@example.com / User123!
+        user_check = conn.execute("SELECT id FROM users WHERE email = 'john@example.com'").fetchone()
+        if not user_check:
+            user_pwd = generate_password_hash("User123!")
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (full_name, email, phone, password_hash, is_active, failed_face_attempts)
+                VALUES ('John Anderson', 'john@example.com', '+1-555-019-2834', ?, 1, 0)
+            """, (user_pwd,))
+            john_id = cursor.lastrowid
+            
+            # Add sample credit cards for John
+            c1_num = "4532759812344242"
+            cursor.execute("""
+                INSERT INTO credit_cards (user_id, cardholder_name, card_number_masked, card_number_hash, last4,
+                                          card_network, expiry_month, expiry_year, card_limit, available_balance, is_primary)
+                VALUES (?, 'JOHN ANDERSON', '**** **** **** 4242', ?, '4242', 'Visa', '11', '2028', 7500.00, 6845.50, 1)
+            """, (john_id, hash_card_number(c1_num)))
+            c1_id = cursor.lastrowid
+            
+            c2_num = "5425233487658821"
+            cursor.execute("""
+                INSERT INTO credit_cards (user_id, cardholder_name, card_number_masked, card_number_hash, last4,
+                                          card_network, expiry_month, expiry_year, card_limit, available_balance, is_primary)
+                VALUES (?, 'JOHN ANDERSON', '**** **** **** 8821', ?, '8821', 'MasterCard', '06', '2027', 4000.00, 3750.00, 0)
+            """, (john_id, hash_card_number(c2_num)))
+            c2_id = cursor.lastrowid
+
+            # Add sample transactions for John
+            sample_txns = [
+                ("TXN-20261118-A78B", john_id, c1_id, "Amazon Prime Marketplace", "Shopping", 129.99, "SUCCESS", None, 95.8, 1, 1, "2026-11-18 10:14:22"),
+                ("TXN-20261119-B42C", john_id, c1_id, "Apple Store Fifth Ave", "Electronics", 499.00, "SUCCESS", None, 93.4, 1, 1, "2026-11-19 14:35:10"),
+                ("TXN-20261120-C91D", john_id, c2_id, "Uber Trip & Eats", "Travel", 25.50, "SUCCESS", None, 91.2, 1, 1, "2026-11-20 08:20:44"),
+                ("TXN-20261120-E33F", john_id, c1_id, "Luxury Watch Boutique", "Shopping", 2450.00, "FAILED", "Face verification failed: match confidence (41.2%) below security threshold (75%).", 41.2, 0, 1, "2026-11-20 23:45:11"),
+                ("TXN-20261121-F88K", john_id, c2_id, "Global Tech Online", "Electronics", 1200.00, "SUSPICIOUS", "Multiple failed biometric attempts from unfamiliar device.", 28.5, 0, 0, "2026-11-21 03:12:05"),
+            ]
+            for st in sample_txns:
+                conn.execute("""
+                    INSERT INTO transactions (transaction_id, user_id, card_id, merchant_name, category, amount,
+                                              status, failure_reason, face_match_score, face_verified, liveness_checked, ip_address, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '127.0.0.1', ?)
+                """, (st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], st[11]))
+                
+        # 3. Sample User 2: emma@example.com / User123!
+        user2_check = conn.execute("SELECT id FROM users WHERE email = 'emma@example.com'").fetchone()
+        if not user2_check:
+            user2_pwd = generate_password_hash("User123!")
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (full_name, email, phone, password_hash, is_active, failed_face_attempts)
+                VALUES ('Emma Davis', 'emma@example.com', '+1-555-482-9901', ?, 1, 0)
+            """, (user2_pwd,))
+            emma_id = cursor.lastrowid
+            
+            c3_num = "378282246310005"
+            cursor.execute("""
+                INSERT INTO credit_cards (user_id, cardholder_name, card_number_masked, card_number_hash, last4,
+                                          card_network, expiry_month, expiry_year, card_limit, available_balance, is_primary)
+                VALUES (?, 'EMMA DAVIS', '**** **** **** 1005', ?, '1005', 'American Express', '09', '2029', 10000.00, 9450.00, 1)
+            """, (emma_id, hash_card_number(c3_num)))
+            c3_id = cursor.lastrowid
+            
+            conn.execute("""
+                INSERT INTO transactions (transaction_id, user_id, card_id, merchant_name, category, amount,
+                                          status, failure_reason, face_match_score, face_verified, liveness_checked, ip_address, created_at)
+                VALUES ('TXN-20261121-G11L', ?, ?, 'Nordstrom Department', 'Shopping', 550.00, 'SUCCESS', NULL, 97.1, 1, 1, '127.0.0.1', '2026-11-21 11:05:00')
+            """, (emma_id, c3_id))
+            
+        conn.commit()
+    finally:
+        conn.close()
+
+if __name__ == '__main__':
+    seed_sample_data()
+    print("Database schema and seed data created successfully.")

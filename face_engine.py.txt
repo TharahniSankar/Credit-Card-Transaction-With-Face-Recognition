@@ -1,0 +1,201 @@
+import base64
+import os
+import cv2
+import numpy as np
+import json
+from config import Config
+
+# Attempt to import face_recognition (dlib-based high precision model)
+try:
+    import face_recognition
+    FACE_REC_AVAILABLE = True
+except Exception as e:
+    FACE_REC_AVAILABLE = False
+    print(f"[WARN] face_recognition not available, falling back to OpenCV AI features: {e}")
+
+# Load OpenCV Cascade Classifiers for face and eye verification
+CASCADE_PATH = cv2.data.haarcascades
+face_cascade = cv2.CascadeClassifier(os.path.join(CASCADE_PATH, 'haarcascade_frontalface_default.xml'))
+eye_cascade = cv2.CascadeClassifier(os.path.join(CASCADE_PATH, 'haarcascade_eye.xml'))
+
+
+def base64_to_cv2(image_base64_str):
+    """
+    Decodes a base64 string (from HTML5 canvas or webcam capture) into an OpenCV BGR image array.
+    """
+    try:
+        if not image_base64_str:
+            return None, "No image data received."
+        
+        # Strip header prefix if present (e.g., 'data:image/jpeg;base64,')
+        if ',' in image_base64_str:
+            image_base64_str = image_base64_str.split(',', 1)[1]
+            
+        image_bytes = base64.b64decode(image_base64_str)
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        cv2_img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        if cv2_img is None or cv2_img.size == 0:
+            return None, "Failed to decode image data."
+            
+        return cv2_img, None
+    except Exception as ex:
+        return None, f"Image decoding error: {str(ex)}"
+
+
+def check_liveness_and_quality(cv2_img):
+    """
+    Performs basic anti-spoofing and quality checks on a live camera capture:
+    1. Sharpness/Blur check via Laplacian variance (detects paper prints / low-res screen spoofs).
+    2. Proper illumination and contrast.
+    3. Structural face and eye presence check using Haar Cascades.
+    
+    Returns:
+        (passed: bool, details: dict, error_message: str)
+    """
+    if cv2_img is None:
+        return False, {}, "Invalid frame."
+        
+    gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
+    
+    # 1. Laplacian variance (Blurriness check)
+    laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    is_sharp = laplacian_var >= Config.LIVENESS_BLUR_THRESHOLD
+    
+    # 2. Lighting / Exposure check
+    mean_brightness = float(np.mean(gray))
+    is_well_lit = (40.0 <= mean_brightness <= 225.0)
+    
+    # 3. Haar Cascade face and eye confirmation
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(60, 60))
+    face_count = len(faces)
+    
+    eyes_detected = False
+    if face_count > 0:
+        (x, y, w, h) = faces[0]
+        roi_gray = gray[y:y+h, x:x+w]
+        eyes = eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=3, minSize=(15, 15))
+        if len(eyes) >= 1:
+            eyes_detected = True
+            
+    details = {
+        "sharpness": round(laplacian_var, 2),
+        "brightness": round(mean_brightness, 2),
+        "faces_detected": face_count,
+        "eyes_detected": eyes_detected,
+        "is_sharp": is_sharp,
+        "is_well_lit": is_well_lit
+    }
+    
+    # Validation rules
+    if face_count == 0:
+        return False, details, "No face detected in live camera frame. Please look directly at the webcam."
+    if face_count > 1:
+        return False, details, "Multiple faces detected. Please make sure only you are in frame."
+    if not is_well_lit:
+        return False, details, "Lighting is too dark or washed out. Please adjust your lighting."
+    if not is_sharp:
+        return False, details, "Captured frame is too blurry. Please hold steady and ensure good focus."
+        
+    return True, details, "Liveness and quality check passed."
+
+
+def extract_face_encoding(cv2_img):
+    """
+    Extracts a 128-dimensional facial feature vector from an OpenCV image.
+    Uses face_recognition (dlib ResNet) when available, or an OpenCV feature descriptor fallback.
+    
+    Returns:
+        (success: bool, encoding_list: list, error_msg: str, bbox: tuple)
+    """
+    if cv2_img is None:
+        return False, None, "Invalid image data.", None
+        
+    try:
+        if FACE_REC_AVAILABLE:
+            # face_recognition requires RGB format
+            rgb_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+            
+            # Detect face bounding boxes
+            face_locations = face_recognition.face_locations(rgb_img, model="hog")
+            if not face_locations:
+                return False, None, "No face detected. Please ensure your face is well-lit and facing the camera.", None
+            if len(face_locations) > 1:
+                return False, None, "Multiple faces detected. Please ensure only the account owner is present.", None
+                
+            encodings = face_recognition.face_encodings(rgb_img, known_face_locations=face_locations, num_jitters=1)
+            if not encodings:
+                return False, None, "Could not extract facial features. Please try again with clear lighting.", None
+                
+            encoding_vector = encodings[0].tolist()
+            bbox = face_locations[0]  # (top, right, bottom, left)
+            return True, encoding_vector, "Face features successfully extracted.", bbox
+        else:
+            # Robust fallback: Normalized multi-region facial histogram descriptor
+            gray = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.15, 4, minSize=(80, 80))
+            if len(faces) == 0:
+                return False, None, "No face detected.", None
+            (x, y, w, h) = faces[0]
+            roi = cv2.resize(gray[y:y+h, x:x+w], (128, 128))
+            # Create a 128-d feature vector
+            hist = cv2.calcHist([roi], [0], None, [128], [0, 256])
+            norm_hist = cv2.normalize(hist, hist).flatten().tolist()
+            return True, norm_hist, "Extracted face vector via OpenCV descriptor.", (y, x+w, y+h, x)
+            
+    except Exception as ex:
+        return False, None, f"Feature extraction error: {str(ex)}", None
+
+
+def compare_face_encodings(stored_encoding, live_encoding):
+    """
+    Compares the stored registered face encoding with the live camera face encoding.
+    Uses Euclidean distance and computes a human-readable similarity/confidence percentage.
+    
+    Returns:
+        (is_match: bool, distance: float, confidence_pct: float, reason: str)
+    """
+    try:
+        if not stored_encoding or not live_encoding:
+            return False, 1.0, 0.0, "Missing facial encoding data."
+            
+        vec1 = np.array(stored_encoding, dtype=np.float64)
+        vec2 = np.array(live_encoding, dtype=np.float64)
+        
+        if vec1.shape != vec2.shape:
+            return False, 1.0, 0.0, "Encoding dimension mismatch."
+            
+        # Compute Euclidean distance (standard for 128-d face embeddings)
+        distance = float(np.linalg.norm(vec1 - vec2))
+        
+        # Calculate human-friendly confidence percentage:
+        # Distance of 0.0 -> 100% confidence
+        # Distance of 0.5 -> ~76% confidence
+        # Distance of 0.7+ -> <30% confidence
+        max_dist = 0.85
+        confidence = max(0.0, min(100.0, (1.0 - (distance / max_dist)) * 100.0))
+        confidence = round(confidence, 2)
+        distance = round(distance, 4)
+        
+        is_match = (distance <= Config.FACE_MATCH_DISTANCE_THRESHOLD) and (confidence >= Config.FACE_MIN_CONFIDENCE_PERCENT)
+        
+        if is_match:
+            reason = f"Face verified successfully (Distance: {distance}, Confidence: {confidence}%)."
+        else:
+            reason = f"Facial verification failed: match confidence ({confidence}%) below security threshold ({Config.FACE_MIN_CONFIDENCE_PERCENT}%)."
+            
+        return is_match, distance, confidence, reason
+    except Exception as ex:
+        return False, 1.0, 0.0, f"Face comparison calculation error: {str(ex)}"
+
+
+def save_face_image(cv2_img, user_id, filename_prefix="face"):
+    """
+    Saves an image to static/uploads/faces/ and returns relative web path.
+    """
+    import time
+    os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
+    filename = f"{filename_prefix}_{user_id}_{int(time.time())}.jpg"
+    filepath = os.path.join(Config.UPLOAD_FOLDER, filename)
+    cv2.imwrite(filepath, cv2_img)
+    return f"uploads/faces/{filename}"

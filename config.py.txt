@@ -1,0 +1,21 @@
+import os
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+class Config:
+    """Application configuration settings."""
+    SECRET_KEY = os.environ.get('SECRET_KEY', 'banking-face-auth-token-secret-xyz-2026')
+    DATABASE_PATH = os.path.join(BASE_DIR, 'bank_system.db')
+    UPLOAD_FOLDER = os.path.join(BASE_DIR, 'static', 'uploads', 'faces')
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB
+    ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp'}
+    
+    # Facial Recognition & Liveness Settings
+    FACE_MATCH_DISTANCE_THRESHOLD = 0.52  # Standard dlib/face_recognition threshold (<= 0.52 = match)
+    FACE_MIN_CONFIDENCE_PERCENT = 75.0    # Required confidence percentage for transaction approval
+    LIVENESS_BLUR_THRESHOLD = 50.0        # Minimum Laplacian variance for anti-spoof blur check
+    
+    # Security parameters
+    MAX_FAILED_ATTEMPTS_BEFORE_FLAG = 3   # Repeated failed face attempts trigger suspicious flag
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = 'Lax'

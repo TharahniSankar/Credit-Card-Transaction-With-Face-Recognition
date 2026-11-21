@@ -1,0 +1,27 @@
+"""
+Standalone script to re-initialize or reset the database with clean test fixtures.
+Run anytime using: python seed_data.py
+"""
+import os
+from config import Config
+from db import seed_sample_data
+
+def main():
+    print(f"[*] Resetting database at: {Config.DATABASE_PATH}")
+    if os.path.exists(Config.DATABASE_PATH):
+        try:
+            os.remove(Config.DATABASE_PATH)
+            print("[+] Previous database file removed.")
+        except Exception as e:
+            print(f"[!] Warning removing database: {e}")
+            
+    seed_sample_data()
+    print("[✓] Database initialized with fresh tables, admin account, demo users, cards, and transactions.")
+    print("----------------------------------------------------------------------")
+    print("Demo Admin Credentials:      Username: admin | Password: admin123")
+    print("Demo User 1 Credentials:     Email: john@example.com | Password: User123!")
+    print("Demo User 2 Credentials:     Email: emma@example.com | Password: User123!")
+    print("----------------------------------------------------------------------")
+
+if __name__ == '__main__':
+    main()

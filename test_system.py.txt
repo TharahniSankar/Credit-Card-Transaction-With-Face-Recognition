@@ -1,0 +1,160 @@
+"""
+Comprehensive Automated Test Suite for Credit Card Transaction System Based on Face Recognition
+Verifies all modules, routes, facial vector comparisons, card masking, and security rules.
+"""
+import unittest
+import json
+import numpy as np
+from app import app
+import db
+from face_engine import (
+    compare_face_encodings,
+    check_liveness_and_quality,
+    extract_face_encoding
+)
+
+class BankSecureSystemTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        app.config['TESTING'] = True
+        app.config['WTF_CSRF_ENABLED'] = False
+        cls.client = app.test_client()
+        db.seed_sample_data()
+
+    def test_01_database_tables_exist(self):
+        """Verifies database tables are created properly."""
+        conn = db.get_db_connection()
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        table_names = [t['name'] for t in tables]
+        conn.close()
+
+        required_tables = ['users', 'credit_cards', 'transactions', 'admin_users', 'security_logs']
+        for rt in required_tables:
+            self.assertIn(rt, table_names, f"Table '{rt}' must exist in database.")
+
+    def test_02_card_masking_security(self):
+        """Verifies credit card numbers are masked and CVVs are not stored."""
+        masked = db.mask_card_number("4111222233334444")
+        self.assertEqual(masked, "**** **** **** 4444")
+        self.assertNotIn("4111", masked)
+
+        network = db.detect_card_network("4111222233334444")
+        self.assertEqual(network, "Visa")
+
+        mc_network = db.detect_card_network("5425123456789012")
+        self.assertEqual(mc_network, "MasterCard")
+
+    def test_03_face_comparison_math(self):
+        """Verifies Euclidean distance vector matching and rejection logic."""
+        # Create identical 128-d vectors
+        np.random.seed(42)
+        base_vector = np.random.randn(128).tolist()
+        identical_vector = list(base_vector)
+
+        is_match, dist, conf, reason = compare_face_encodings(base_vector, identical_vector)
+        self.assertTrue(is_match, "Identical face vectors must match.")
+        self.assertAlmostEqual(dist, 0.0, places=3)
+        self.assertGreaterEqual(conf, 99.0)
+
+        # Create completely different vector (different person)
+        different_vector = (np.random.randn(128) * 3).tolist()
+        is_match2, dist2, conf2, reason2 = compare_face_encodings(base_vector, different_vector)
+        self.assertFalse(is_match2, "Different face vectors must be rejected.")
+        self.assertGreater(dist2, 0.52)
+
+    def test_04_public_routes(self):
+        """Tests that public routes return 200 OK."""
+        res_home = self.client.get('/')
+        self.assertEqual(res_home.status_code, 200)
+
+        res_login = self.client.get('/login')
+        self.assertEqual(res_login.status_code, 200)
+
+        res_reg = self.client.get('/register')
+        self.assertEqual(res_reg.status_code, 200)
+
+        res_admin_login = self.client.get('/admin/login')
+        self.assertEqual(res_admin_login.status_code, 200)
+
+    def test_05_client_authentication_and_dashboard(self):
+        """Tests client login flow and dashboard access."""
+        login_res = self.client.post('/login', data={
+            'email': 'john@example.com',
+            'password': 'User123!'
+        }, follow_redirects=True)
+        self.assertEqual(login_res.status_code, 200)
+
+        # Dashboard access
+        dash_res = self.client.get('/dashboard')
+        self.assertEqual(dash_res.status_code, 200)
+        self.assertIn(b'John Anderson', dash_res.data)
+
+        # Cards page
+        cards_res = self.client.get('/cards')
+        self.assertEqual(cards_res.status_code, 200)
+        self.assertIn(b'Credit Card Management', cards_res.data)
+
+        # History page
+        txns_res = self.client.get('/transactions')
+        self.assertEqual(txns_res.status_code, 200)
+        self.assertIn(b'Transaction History', txns_res.data)
+
+    def test_06_admin_authentication_and_dashboard(self):
+        """Tests administrator login and admin views."""
+        # First logout client
+        self.client.get('/logout')
+
+        # Admin login
+        adm_login_res = self.client.post('/admin/login', data={
+            'username': 'admin',
+            'password': 'admin123'
+        }, follow_redirects=True)
+        self.assertEqual(adm_login_res.status_code, 200)
+
+        # Admin dashboard
+        adm_dash = self.client.get('/admin/dashboard')
+        self.assertEqual(adm_dash.status_code, 200)
+        self.assertIn(b'Transaction Monitoring', adm_dash.data)
+
+        # Admin users directory
+        adm_users = self.client.get('/admin/users')
+        self.assertEqual(adm_users.status_code, 200)
+        self.assertIn(b'john@example.com', adm_users.data)
+
+        # Admin transactions ledger
+        adm_txns = self.client.get('/admin/transactions')
+        self.assertEqual(adm_txns.status_code, 200)
+
+        # Admin security logs
+        adm_logs = self.client.get('/admin/security-logs')
+        self.assertEqual(adm_logs.status_code, 200)
+
+    def test_07_insufficient_balance_rejection(self):
+        """Tests that excessive transaction amounts are rejected."""
+        # Login as John
+        self.client.post('/login', data={
+            'email': 'john@example.com',
+            'password': 'User123!'
+        })
+        user = db.get_user_by_email('john@example.com')
+        cards = db.get_user_cards(user['id'])
+        primary_card = cards[0]
+
+        # Attempt to transact $999,999.00
+        payload = {
+            'card_id': primary_card['id'],
+            'merchant_name': 'Luxury Megayacht',
+            'category': 'Travel',
+            'amount': '999999.00',
+            'image_data': 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/'
+        }
+        res = self.client.post('/api/verify_face_transaction',
+                               data=json.dumps(payload),
+                               content_type='application/json')
+        self.assertEqual(res.status_code, 400)
+        data = res.get_json()
+        self.assertFalse(data['success'])
+        self.assertIn('Insufficient credit balance', data['message'])
+
+if __name__ == '__main__':
+    unittest.main()
